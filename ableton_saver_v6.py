@@ -7,10 +7,14 @@ import webbrowser
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QFrame, QGraphicsDropShadowEffect,
-    QButtonGroup
+    QButtonGroup, QSystemTrayIcon, QMenu,
+    QGraphicsView, QGraphicsScene
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont, QCursor
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QPropertyAnimation, QEasingCurve, QRect
+from PyQt6.QtGui import (
+    QColor, QPainter, QBrush, QPen, QFont, QCursor,
+    QIcon, QAction, QPixmap, QPolygon, QKeySequence
+)
 
 # --- DESIGN SYSTEM ---
 COLOR_ACCENT = "#D4FF00"
@@ -152,10 +156,12 @@ class TriangleSaver(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # Window setup - frameless transparent
+        # Window setup - frameless transparent, resizable
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setMinimumSize(300, 500)
+        self.setMouseTracking(True)  # Track mouse for resize cursors
 
         # Center on screen
         screen = QApplication.primaryScreen().geometry()
@@ -171,12 +177,31 @@ class TriangleSaver(QMainWindow):
         self.drag_position = None
         self.is_timer_mode = False
         self.main_widgets = []  # Store widgets to hide in timer mode
+        self.base_width = WINDOW_WIDTH
+        self.base_height = WINDOW_HEIGHT
+        self.resize_edge = None
+        self.resize_margin = 8  # Pixels from edge that trigger resize cursor
 
         # Build UI
         self.build_ui()
 
+        # Wrap UI in QGraphicsView for proportional scaling
+        self.setup_graphics_view()
+
         # Sync startup toggle with actual plist state
         self.sync_startup_toggle()
+
+        # Create menu bar (system tray) icon
+        self.create_tray_icon()
+
+        # Default keyboard shortcut (Ctrl+Shift+T)
+        self.is_recording_shortcut = False
+        self.current_shortcut = (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+            Qt.Key.Key_T
+        )
+        self.global_monitor = None
+        self.register_global_shortcut()
 
         # Timer
         self.timer = QTimer()
@@ -184,12 +209,13 @@ class TriangleSaver(QMainWindow):
         self.timer.start(100)
 
     def build_ui(self):
-        # Central widget
-        central = QWidget()
-        self.setCentralWidget(central)
+        # Inner widget (will be embedded in QGraphicsView for scaling)
+        self.inner_widget = QWidget()
+        self.inner_widget.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.inner_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         # Main layout
-        layout = QVBoxLayout(central)
+        layout = QVBoxLayout(self.inner_widget)
         layout.setContentsMargins(10, 10, 10, 10)
 
         # Glass container
@@ -417,6 +443,37 @@ class TriangleSaver(QMainWindow):
             row.addStretch()
             container_layout.addLayout(row)
 
+        # --- Keyboard Shortcut Setting ---
+        shortcut_row = QHBoxLayout()
+        shortcut_row.setSpacing(10)
+
+        shortcut_label = QLabel("Toggle Shortcut")
+        shortcut_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-family: 'Helvetica Neue'; font-size: 12px;")
+
+        self.shortcut_input = QPushButton("Ctrl+Shift+T")
+        self.shortcut_input.setFixedSize(130, 28)
+        self.shortcut_input.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.shortcut_input.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #0a0a0a;
+                color: {COLOR_ACCENT};
+                border: 1px solid #333333;
+                border-radius: 14px;
+                font-family: 'Helvetica Neue';
+                font-size: 11px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                border-color: {COLOR_ACCENT};
+            }}
+        """)
+        self.shortcut_input.clicked.connect(self.start_shortcut_recording)
+
+        shortcut_row.addWidget(shortcut_label)
+        shortcut_row.addStretch()
+        shortcut_row.addWidget(self.shortcut_input)
+        container_layout.addLayout(shortcut_row)
+
         container_layout.addSpacing(10)
 
         # --- Separator ---
@@ -501,6 +558,42 @@ class TriangleSaver(QMainWindow):
 
         layout.addWidget(self.container)
 
+    def setup_graphics_view(self):
+        """Embed the inner UI widget in a QGraphicsView for proportional scaling."""
+        self.scene = QGraphicsScene(self)
+        self.proxy_widget = self.scene.addWidget(self.inner_widget)
+
+        self.graphics_view = QGraphicsView(self.scene, self)
+        self.graphics_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.graphics_view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.graphics_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.graphics_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.graphics_view.setFrameStyle(0)
+        self.graphics_view.setStyleSheet("background: transparent;")
+        self.graphics_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.setCentralWidget(self.graphics_view)
+        self.update_scale()
+
+    def update_scale(self):
+        """Scale the UI proportionally to fit the current window size."""
+        if not hasattr(self, 'graphics_view'):
+            return
+        view_width = self.graphics_view.viewport().width()
+        view_height = self.graphics_view.viewport().height()
+        if view_width <= 0 or view_height <= 0:
+            return
+
+        scale_x = view_width / self.base_width
+        scale_y = view_height / self.base_height
+        scale = min(scale_x, scale_y)
+
+        from PyQt6.QtGui import QTransform
+        transform = QTransform()
+        transform.scale(scale, scale)
+        self.graphics_view.setTransform(transform)
+        self.graphics_view.centerOn(self.proxy_widget)
+
     def update_switch_style(self, switch):
         if switch.isChecked():
             # ON state - accent color with circle on right
@@ -530,6 +623,76 @@ class TriangleSaver(QMainWindow):
                 }}
             """)
             switch.setText("●  ")
+
+    # --- System Tray / Menu Bar ---
+    def create_tray_icon(self):
+        """Create the macOS menu bar (system tray) icon with a triangle logo."""
+        # Generate a triangle icon programmatically (no external file needed)
+        pixmap = QPixmap(22, 22)
+        pixmap.fill(QColor(0, 0, 0, 0))  # Transparent background
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QBrush(QColor(COLOR_ACCENT)))
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        triangle = QPolygon([QPoint(11, 3), QPoint(3, 19), QPoint(19, 19)])
+        painter.drawPolygon(triangle)
+        painter.end()
+
+        icon = QIcon(pixmap)
+        self.tray_icon = QSystemTrayIcon(icon, self)
+
+        # Build the context menu
+        tray_menu = QMenu()
+        self.action_show_hide = QAction("Hide Window", self)
+        self.action_show_hide.triggered.connect(self.toggle_window_visibility)
+        tray_menu.addAction(self.action_show_hide)
+
+        tray_menu.addSeparator()
+
+        action_quit = QAction("Quit Triangle Saver", self)
+        action_quit.triggered.connect(self.quit_app)
+        tray_menu.addAction(action_quit)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.setToolTip("Triangle Ableton Auto Saver")
+        self.tray_icon.activated.connect(self.tray_icon_activated)
+        self.tray_icon.show()
+
+    def toggle_window_visibility(self):
+        """Show the window if hidden, hide if visible."""
+        if self.isVisible():
+            self.hide()
+            self.action_show_hide.setText("Show Window")
+        else:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.action_show_hide.setText("Hide Window")
+
+    def tray_icon_activated(self, reason):
+        """Handle tray icon clicks — toggle window on click."""
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_window_visibility()
+
+    def quit_app(self):
+        """Fully quit the application. Only accessible from the tray menu."""
+        # Remove global hotkey monitor
+        if hasattr(self, 'global_monitor') and self.global_monitor:
+            try:
+                from AppKit import NSEvent
+                NSEvent.removeMonitor_(self.global_monitor)
+            except:
+                pass
+        self.tray_icon.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event):
+        """Intercept close — hide window instead of quitting.
+        App keeps running in the menu bar.
+        """
+        event.ignore()
+        self.hide()
+        self.action_show_hide.setText("Show Window")
 
     def sync_startup_toggle(self):
         """Sync the startup toggle to match whether the plist actually exists."""
@@ -647,8 +810,10 @@ class TriangleSaver(QMainWindow):
             self.btn_back_main.show()
 
             # Resize window to compact
-            self.setFixedSize(WINDOW_WIDTH, 320)
-            self.container.setFixedSize(WINDOW_WIDTH - 20, 300)
+            self.base_height = 320
+            self.inner_widget.setFixedSize(WINDOW_WIDTH, 320)
+            self.resize(WINDOW_WIDTH, 320)
+            self.update_scale()
 
         else:
             # Exit timer mode - full view
@@ -673,8 +838,10 @@ class TriangleSaver(QMainWindow):
             self.btn_back_main.hide()
 
             # Restore window size
-            self.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
-            self.container.setFixedSize(WINDOW_WIDTH - 20, WINDOW_HEIGHT - 20)
+            self.base_height = WINDOW_HEIGHT
+            self.inner_widget.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+            self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+            self.update_scale()
 
     def set_time_unit(self, unit):
         self.time_unit = unit
@@ -775,23 +942,37 @@ class TriangleSaver(QMainWindow):
         if self.is_running:
             remaining = int(self.next_save_time - time.time())
             if remaining <= 0:
-                if self.is_ableton_frontmost():
+                if self.is_ableton_running():
                     self.perform_save()
                     self.next_save_time = time.time() + self.interval_seconds
                     play_notification_sound()
                 else:
                     self.lbl_timer.setText("PAUSED")
-                    self.lbl_timer_desc.setText("Focus Ableton to resume")
+                    self.lbl_timer_desc.setText("Open Ableton to resume")
             else:
                 self.update_timer_display(remaining)
 
     def is_ableton_frontmost(self):
+        """Check if Ableton Live is the frontmost (active) application."""
         try:
             from AppKit import NSWorkspace
             active_app = NSWorkspace.sharedWorkspace().frontmostApplication()
             if active_app:
                 app_name = active_app.localizedName()
                 return "Live" in app_name or "Ableton" in app_name
+        except:
+            pass
+        return False
+
+    def is_ableton_running(self):
+        """Check if Ableton Live is running (not necessarily frontmost)."""
+        try:
+            from AppKit import NSWorkspace
+            running_apps = NSWorkspace.sharedWorkspace().runningApplications()
+            for app in running_apps:
+                name = app.localizedName() or ""
+                if "Live" in name or "Ableton" in name:
+                    return True
         except:
             pass
         return False
@@ -805,34 +986,233 @@ class TriangleSaver(QMainWindow):
             return False
 
     def perform_save(self):
+        """Save Ableton project by activating it first, then sending Cmd+S."""
         script_save = '''
         tell application "System Events"
+            set abletonProcess to first process whose name contains "Live"
+            set frontmost of abletonProcess to true
+            delay 0.2
             key code 1 using {command down}
         end tell
         '''
-        self.run_applescript(script_save)
-        self.lbl_last_saved.setText(f"Saved @ {time.strftime('%H:%M:%S')}")
-        self.lbl_last_saved.setStyleSheet(f"color: {COLOR_ACCENT}; font-family: 'Helvetica Neue'; font-size: 10px;")
+        success = self.run_applescript(script_save)
+        if success:
+            self.lbl_last_saved.setText(f"Saved @ {time.strftime('%H:%M:%S')}")
+            self.lbl_last_saved.setStyleSheet(f"color: {COLOR_ACCENT}; font-family: 'Helvetica Neue'; font-size: 10px;")
+        else:
+            self.lbl_last_saved.setText(f"Save failed @ {time.strftime('%H:%M:%S')}")
+            self.lbl_last_saved.setStyleSheet(f"color: {COLOR_DANGER}; font-family: 'Helvetica Neue'; font-size: 10px;")
+
+    # --- Keyboard Shortcut ---
+    def start_shortcut_recording(self):
+        """Enter recording mode — next key combo will become the shortcut."""
+        self.is_recording_shortcut = True
+        self.shortcut_input.setText("Press keys...")
+        self.shortcut_input.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #0a0a0a;
+                color: {COLOR_DANGER};
+                border: 2px solid {COLOR_DANGER};
+                border-radius: 14px;
+                font-family: 'Helvetica Neue';
+                font-size: 11px;
+                font-weight: bold;
+            }}
+        """)
+
+    def register_global_shortcut(self):
+        """Register a global hotkey using macOS NSEvent global monitor."""
+        # Remove previous monitor if any
+        if hasattr(self, 'global_monitor') and self.global_monitor:
+            try:
+                from AppKit import NSEvent
+                NSEvent.removeMonitor_(self.global_monitor)
+            except:
+                pass
+            self.global_monitor = None
+
+        if not hasattr(self, 'current_shortcut') or not self.current_shortcut:
+            return
+
+        try:
+            from AppKit import NSEvent
+            # NSKeyDownMask = 1 << 10
+            NSKeyDownMask = 1 << 10
+
+            target_modifiers, target_key = self.current_shortcut
+            target_key_char = QKeySequence(target_key).toString().lower()
+
+            def handler(event):
+                chars = event.charactersIgnoringModifiers()
+                if chars and chars.lower() == target_key_char:
+                    flags = event.modifierFlags()
+                    # Check modifiers (macOS flags)
+                    need_ctrl = bool(target_modifiers & Qt.KeyboardModifier.ControlModifier)
+                    need_shift = bool(target_modifiers & Qt.KeyboardModifier.ShiftModifier)
+                    need_alt = bool(target_modifiers & Qt.KeyboardModifier.AltModifier)
+                    need_cmd = bool(target_modifiers & Qt.KeyboardModifier.MetaModifier)
+
+                    has_ctrl = bool(flags & (1 << 18))   # NSControlKeyMask
+                    has_shift = bool(flags & (1 << 17))  # NSShiftKeyMask
+                    has_alt = bool(flags & (1 << 19))    # NSAlternateKeyMask
+                    has_cmd = bool(flags & (1 << 20))    # NSCommandKeyMask
+
+                    if (need_ctrl == has_ctrl and need_shift == has_shift
+                            and need_alt == has_alt and need_cmd == has_cmd):
+                        QTimer.singleShot(0, self.toggle_window_visibility)
+                return event
+
+            self.global_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSKeyDownMask, handler
+            )
+        except Exception as e:
+            print(f"Failed to register global shortcut: {e}")
 
     def close_app(self):
-        self.close()
+        """Hide the window instead of quitting. App stays in menu bar."""
+        self.hide()
+        self.action_show_hide.setText("Show Window")
 
-    # --- Mouse events for dragging ---
+    # --- Mouse events for dragging and resizing ---
+    def _get_resize_edge(self, pos):
+        """Determine which edge/corner the mouse is near, or None for drag area."""
+        rect = self.rect()
+        m = self.resize_margin
+
+        on_left = pos.x() <= m
+        on_right = pos.x() >= rect.width() - m
+        on_top = pos.y() <= m
+        on_bottom = pos.y() >= rect.height() - m
+
+        if on_top and on_left:     return 'top-left'
+        if on_top and on_right:    return 'top-right'
+        if on_bottom and on_left:  return 'bottom-left'
+        if on_bottom and on_right: return 'bottom-right'
+        if on_left:                return 'left'
+        if on_right:               return 'right'
+        if on_top:                 return 'top'
+        if on_bottom:              return 'bottom'
+        return None
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.resize_edge = self._get_resize_edge(event.position().toPoint())
+            if self.resize_edge is None:
+                # Not on an edge — drag the window
+                self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            else:
+                # On an edge — start resize
+                self.drag_position = None
+                self.resize_start_pos = event.globalPosition().toPoint()
+                self.resize_start_geo = self.geometry()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton and self.drag_position:
-            self.move(event.globalPosition().toPoint() - self.drag_position)
+        if event.buttons() == Qt.MouseButton.NoButton:
+            # Hovering — update cursor based on edge proximity
+            edge = self._get_resize_edge(event.position().toPoint())
+            cursor_map = {
+                'left': Qt.CursorShape.SizeHorCursor,
+                'right': Qt.CursorShape.SizeHorCursor,
+                'top': Qt.CursorShape.SizeVerCursor,
+                'bottom': Qt.CursorShape.SizeVerCursor,
+                'top-left': Qt.CursorShape.SizeFDiagCursor,
+                'bottom-right': Qt.CursorShape.SizeFDiagCursor,
+                'top-right': Qt.CursorShape.SizeBDiagCursor,
+                'bottom-left': Qt.CursorShape.SizeBDiagCursor,
+            }
+            self.setCursor(QCursor(cursor_map.get(edge, Qt.CursorShape.ArrowCursor)))
+            return
+
+        if event.buttons() == Qt.MouseButton.LeftButton:
+            if self.resize_edge and hasattr(self, 'resize_start_pos'):
+                # Resizing
+                delta = event.globalPosition().toPoint() - self.resize_start_pos
+                geo = QRect(self.resize_start_geo)
+
+                if 'left' in self.resize_edge:
+                    geo.setLeft(self.resize_start_geo.left() + delta.x())
+                if 'right' in self.resize_edge:
+                    geo.setRight(self.resize_start_geo.right() + delta.x())
+                if 'top' in self.resize_edge:
+                    geo.setTop(self.resize_start_geo.top() + delta.y())
+                if 'bottom' in self.resize_edge:
+                    geo.setBottom(self.resize_start_geo.bottom() + delta.y())
+
+                # Enforce minimum size
+                if geo.width() >= self.minimumWidth() and geo.height() >= self.minimumHeight():
+                    self.setGeometry(geo)
+                    self.update_scale()
+
+            elif self.drag_position:
+                # Dragging
+                self.move(event.globalPosition().toPoint() - self.drag_position)
+
+    def mouseReleaseEvent(self, event):
+        self.resize_edge = None
+        self.drag_position = None
+
+    def resizeEvent(self, event):
+        """Update the UI scale whenever the window is resized."""
+        super().resizeEvent(event)
+        self.update_scale()
 
     def keyPressEvent(self, event):
+        # Shortcut recording mode
+        if hasattr(self, 'is_recording_shortcut') and self.is_recording_shortcut:
+            modifiers = event.modifiers()
+            key = event.key()
+
+            # Ignore bare modifier keys
+            if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+                return
+
+            # Build the display string
+            parts = []
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                parts.append("Ctrl")
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                parts.append("Shift")
+            if modifiers & Qt.KeyboardModifier.AltModifier:
+                parts.append("Alt")
+            if modifiers & Qt.KeyboardModifier.MetaModifier:
+                parts.append("Cmd")
+
+            key_name = QKeySequence(key).toString()
+            if key_name:
+                parts.append(key_name)
+
+            shortcut_str = "+".join(parts)
+            self.shortcut_input.setText(shortcut_str)
+            self.current_shortcut = (modifiers, key)
+            self.is_recording_shortcut = False
+
+            # Restore button style
+            self.shortcut_input.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #0a0a0a;
+                    color: {COLOR_ACCENT};
+                    border: 1px solid #333333;
+                    border-radius: 14px;
+                    font-family: 'Helvetica Neue';
+                    font-size: 11px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    border-color: {COLOR_ACCENT};
+                }}
+            """)
+
+            # Re-register global monitor with new shortcut
+            self.register_global_shortcut()
+            return
+
         if event.key() == Qt.Key.Key_Escape:
             self.close_app()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # Keep app alive when window is hidden
     window = TriangleSaver()
     window.show()
     sys.exit(app.exec())
