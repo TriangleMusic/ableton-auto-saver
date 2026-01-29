@@ -159,8 +159,8 @@ class TriangleSaver(QMainWindow):
         # Window setup - frameless transparent, resizable
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
-        self.setMinimumSize(300, 500)
+        self.setMinimumSize(320, 650)
+        self.setMaximumSize(520, 1050)
         self.setMouseTracking(True)  # Track mouse for resize cursors
 
         # Center on screen
@@ -180,7 +180,7 @@ class TriangleSaver(QMainWindow):
         self.base_width = WINDOW_WIDTH
         self.base_height = WINDOW_HEIGHT
         self.resize_edge = None
-        self.resize_margin = 8  # Pixels from edge that trigger resize cursor
+        self.resize_margin = 15  # Pixels from edge that trigger resize cursor
 
         # Build UI
         self.build_ui()
@@ -573,7 +573,14 @@ class TriangleSaver(QMainWindow):
         self.graphics_view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         self.setCentralWidget(self.graphics_view)
-        self.update_scale()
+
+        # Install event filter so main window receives mouse events for drag/resize
+        self.graphics_view.viewport().installEventFilter(self)
+        self.graphics_view.viewport().setMouseTracking(True)
+
+        # Force the default size AFTER central widget is set
+        self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        QTimer.singleShot(50, self.update_scale)  # Slight delay to ensure layout is ready
 
     def update_scale(self):
         """Scale the UI proportionally to fit the current window size."""
@@ -812,8 +819,10 @@ class TriangleSaver(QMainWindow):
             # Resize window to compact
             self.base_height = 320
             self.inner_widget.setFixedSize(WINDOW_WIDTH, 320)
+            self.setMinimumSize(320, 280)
+            self.setMaximumSize(520, 420)
             self.resize(WINDOW_WIDTH, 320)
-            self.update_scale()
+            QTimer.singleShot(50, self.update_scale)
 
         else:
             # Exit timer mode - full view
@@ -840,8 +849,10 @@ class TriangleSaver(QMainWindow):
             # Restore window size
             self.base_height = WINDOW_HEIGHT
             self.inner_widget.setFixedSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+            self.setMinimumSize(320, 650)
+            self.setMaximumSize(520, 1050)
             self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
-            self.update_scale()
+            QTimer.singleShot(50, self.update_scale)
 
     def set_time_unit(self, unit):
         self.time_unit = unit
@@ -986,22 +997,48 @@ class TriangleSaver(QMainWindow):
             return False
 
     def perform_save(self):
-        """Save Ableton project by activating it first, then sending Cmd+S."""
-        script_save = '''
-        tell application "System Events"
-            set abletonProcess to first process whose name contains "Live"
-            set frontmost of abletonProcess to true
-            delay 0.2
-            key code 1 using {command down}
-        end tell
-        '''
-        success = self.run_applescript(script_save)
-        if success:
+        """Save Ableton project using Quartz CGEvent (bypasses osascript permissions)."""
+        try:
+            from AppKit import NSWorkspace
+            from Quartz import (
+                CGEventCreateKeyboardEvent, CGEventSetFlags, CGEventPost,
+                kCGHIDEventTap, kCGEventFlagMaskCommand
+            )
+
+            # Activate Ableton
+            running_apps = NSWorkspace.sharedWorkspace().runningApplications()
+            activated = False
+            for app in running_apps:
+                name = app.localizedName() or ""
+                if "Live" in name or "Ableton" in name:
+                    app.activateWithOptions_(0)
+                    activated = True
+                    break
+
+            if not activated:
+                self.lbl_last_saved.setText(f"Ableton not found @ {time.strftime('%H:%M:%S')}")
+                self.lbl_last_saved.setStyleSheet(f"color: {COLOR_DANGER}; font-family: 'Helvetica Neue'; font-size: 10px;")
+                return
+
+            # Wait for Ableton to come to front
+            time.sleep(0.4)
+
+            # Send Cmd+S via CGEvent (key code 1 = S key)
+            event_down = CGEventCreateKeyboardEvent(None, 1, True)
+            CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
+            event_up = CGEventCreateKeyboardEvent(None, 1, False)
+            CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
+
+            CGEventPost(kCGHIDEventTap, event_down)
+            CGEventPost(kCGHIDEventTap, event_up)
+
             self.lbl_last_saved.setText(f"Saved @ {time.strftime('%H:%M:%S')}")
             self.lbl_last_saved.setStyleSheet(f"color: {COLOR_ACCENT}; font-family: 'Helvetica Neue'; font-size: 10px;")
-        else:
+
+        except Exception as e:
             self.lbl_last_saved.setText(f"Save failed @ {time.strftime('%H:%M:%S')}")
             self.lbl_last_saved.setStyleSheet(f"color: {COLOR_DANGER}; font-family: 'Helvetica Neue'; font-size: 10px;")
+            print(f"Save error: {e}")
 
     # --- Keyboard Shortcut ---
     def start_shortcut_recording(self):
@@ -1074,15 +1111,16 @@ class TriangleSaver(QMainWindow):
         self.action_show_hide.setText("Show Window")
 
     # --- Mouse events for dragging and resizing ---
-    def _get_resize_edge(self, pos):
+    def _get_resize_edge(self, global_pos):
         """Determine which edge/corner the mouse is near, or None for drag area."""
+        local = self.mapFromGlobal(global_pos)
         rect = self.rect()
         m = self.resize_margin
 
-        on_left = pos.x() <= m
-        on_right = pos.x() >= rect.width() - m
-        on_top = pos.y() <= m
-        on_bottom = pos.y() >= rect.height() - m
+        on_left = local.x() <= m
+        on_right = local.x() >= rect.width() - m
+        on_top = local.y() <= m
+        on_bottom = local.y() >= rect.height() - m
 
         if on_top and on_left:     return 'top-left'
         if on_top and on_right:    return 'top-right'
@@ -1094,62 +1132,78 @@ class TriangleSaver(QMainWindow):
         if on_bottom:              return 'bottom'
         return None
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.resize_edge = self._get_resize_edge(event.position().toPoint())
-            if self.resize_edge is None:
-                # Not on an edge — drag the window
-                self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            else:
-                # On an edge — start resize
-                self.drag_position = None
-                self.resize_start_pos = event.globalPosition().toPoint()
-                self.resize_start_geo = self.geometry()
+    def eventFilter(self, obj, event):
+        """Intercept mouse events from the QGraphicsView viewport for drag/resize."""
+        from PyQt6.QtCore import QEvent, QPointF
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.NoButton:
-            # Hovering — update cursor based on edge proximity
-            edge = self._get_resize_edge(event.position().toPoint())
-            cursor_map = {
-                'left': Qt.CursorShape.SizeHorCursor,
-                'right': Qt.CursorShape.SizeHorCursor,
-                'top': Qt.CursorShape.SizeVerCursor,
-                'bottom': Qt.CursorShape.SizeVerCursor,
-                'top-left': Qt.CursorShape.SizeFDiagCursor,
-                'bottom-right': Qt.CursorShape.SizeFDiagCursor,
-                'top-right': Qt.CursorShape.SizeBDiagCursor,
-                'bottom-left': Qt.CursorShape.SizeBDiagCursor,
-            }
-            self.setCursor(QCursor(cursor_map.get(edge, Qt.CursorShape.ArrowCursor)))
-            return
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                global_pos = event.globalPosition().toPoint()
+                self.resize_edge = self._get_resize_edge(global_pos)
+                if self.resize_edge:
+                    # On an edge — start resize
+                    self.drag_position = None
+                    self.resize_start_pos = global_pos
+                    self.resize_start_geo = self.geometry()
+                    return True  # Consume event
+                else:
+                    # Not on edge — start drag (from anywhere)
+                    self.drag_position = global_pos - self.frameGeometry().topLeft()
+                    # Don't consume — let clicks pass through to buttons
+                    return False
 
-        if event.buttons() == Qt.MouseButton.LeftButton:
-            if self.resize_edge and hasattr(self, 'resize_start_pos'):
-                # Resizing
-                delta = event.globalPosition().toPoint() - self.resize_start_pos
-                geo = QRect(self.resize_start_geo)
+        elif event.type() == QEvent.Type.MouseMove:
+            global_pos = event.globalPosition().toPoint()
 
-                if 'left' in self.resize_edge:
-                    geo.setLeft(self.resize_start_geo.left() + delta.x())
-                if 'right' in self.resize_edge:
-                    geo.setRight(self.resize_start_geo.right() + delta.x())
-                if 'top' in self.resize_edge:
-                    geo.setTop(self.resize_start_geo.top() + delta.y())
-                if 'bottom' in self.resize_edge:
-                    geo.setBottom(self.resize_start_geo.bottom() + delta.y())
+            if event.buttons() == Qt.MouseButton.NoButton:
+                # Hovering — update cursor
+                edge = self._get_resize_edge(global_pos)
+                cursor_map = {
+                    'left': Qt.CursorShape.SizeHorCursor,
+                    'right': Qt.CursorShape.SizeHorCursor,
+                    'top': Qt.CursorShape.SizeVerCursor,
+                    'bottom': Qt.CursorShape.SizeVerCursor,
+                    'top-left': Qt.CursorShape.SizeFDiagCursor,
+                    'bottom-right': Qt.CursorShape.SizeFDiagCursor,
+                    'top-right': Qt.CursorShape.SizeBDiagCursor,
+                    'bottom-left': Qt.CursorShape.SizeBDiagCursor,
+                }
+                cursor = cursor_map.get(edge, Qt.CursorShape.ArrowCursor)
+                self.graphics_view.viewport().setCursor(QCursor(cursor))
+                return False
 
-                # Enforce minimum size
-                if geo.width() >= self.minimumWidth() and geo.height() >= self.minimumHeight():
-                    self.setGeometry(geo)
-                    self.update_scale()
+            if event.buttons() == Qt.MouseButton.LeftButton:
+                if self.resize_edge and hasattr(self, 'resize_start_pos'):
+                    # Resizing
+                    delta = global_pos - self.resize_start_pos
+                    geo = QRect(self.resize_start_geo)
 
-            elif self.drag_position:
-                # Dragging
-                self.move(event.globalPosition().toPoint() - self.drag_position)
+                    if 'left' in self.resize_edge:
+                        geo.setLeft(self.resize_start_geo.left() + delta.x())
+                    if 'right' in self.resize_edge:
+                        geo.setRight(self.resize_start_geo.right() + delta.x())
+                    if 'top' in self.resize_edge:
+                        geo.setTop(self.resize_start_geo.top() + delta.y())
+                    if 'bottom' in self.resize_edge:
+                        geo.setBottom(self.resize_start_geo.bottom() + delta.y())
 
-    def mouseReleaseEvent(self, event):
-        self.resize_edge = None
-        self.drag_position = None
+                    # Enforce min/max size
+                    if (geo.width() >= self.minimumWidth() and geo.height() >= self.minimumHeight()
+                            and geo.width() <= self.maximumWidth() and geo.height() <= self.maximumHeight()):
+                        self.setGeometry(geo)
+                        self.update_scale()
+                    return True  # Consume event
+
+                elif self.drag_position:
+                    # Dragging window
+                    self.move(global_pos - self.drag_position)
+                    return True  # Consume event
+
+        elif event.type() == QEvent.Type.MouseButtonRelease:
+            self.resize_edge = None
+            self.drag_position = None
+
+        return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
         """Update the UI scale whenever the window is resized."""
