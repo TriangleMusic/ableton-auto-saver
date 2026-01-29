@@ -175,6 +175,9 @@ class TriangleSaver(QMainWindow):
         # Build UI
         self.build_ui()
 
+        # Sync startup toggle with actual plist state
+        self.sync_startup_toggle()
+
         # Timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_loop)
@@ -528,6 +531,66 @@ class TriangleSaver(QMainWindow):
             """)
             switch.setText("●  ")
 
+    def sync_startup_toggle(self):
+        """Sync the startup toggle to match whether the plist actually exists."""
+        if "startup" in self.switches:
+            switch = self.switches["startup"]
+            actual_state = self.is_startup_enabled()
+            switch.setChecked(actual_state)
+            self.update_switch_style(switch)
+
+    # --- Launch on Startup ---
+    def get_plist_path(self):
+        return os.path.expanduser("~/Library/LaunchAgents/com.triangle.abletonsaver.plist")
+
+    def is_startup_enabled(self):
+        """Check if the launch agent plist exists."""
+        return os.path.exists(self.get_plist_path())
+
+    def enable_launch_on_startup(self):
+        """Create a macOS Launch Agent plist so the app runs at login."""
+        plist_path = self.get_plist_path()
+        python_path = sys.executable  # Use the Python that's running this script
+        script_path = os.path.abspath(__file__)
+
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.triangle.abletonsaver</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_path}</string>
+        <string>{script_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/ableton_saver.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ableton_saver_error.log</string>
+</dict>
+</plist>
+"""
+        try:
+            os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+            with open(plist_path, "w") as f:
+                f.write(plist_content)
+            subprocess.run(["launchctl", "load", plist_path], check=True)
+        except Exception as e:
+            print(f"Failed to enable startup: {e}")
+
+    def disable_launch_on_startup(self):
+        """Remove the macOS Launch Agent plist to stop running at login."""
+        plist_path = self.get_plist_path()
+        try:
+            if os.path.exists(plist_path):
+                subprocess.run(["launchctl", "unload", plist_path], stderr=subprocess.DEVNULL)
+                os.remove(plist_path)
+        except Exception as e:
+            print(f"Failed to disable startup: {e}")
+
     def toggle_setting(self, switch, key):
         checked = switch.isChecked()
         self.update_switch_style(switch)
@@ -540,6 +603,11 @@ class TriangleSaver(QMainWindow):
             self.show()
         elif key == "pro":
             self.is_pro_mode = checked
+        elif key == "startup":
+            if checked:
+                self.enable_launch_on_startup()
+            else:
+                self.disable_launch_on_startup()
 
     def toggle_timer_mode(self):
         self.is_timer_mode = not self.is_timer_mode
